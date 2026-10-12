@@ -1,0 +1,62 @@
+# Release: a pushed tag v<version> (= FW_VERSION in src/config.h) builds the firmware and publishes it as a GitHub
+# release: the factory image (bootloader, partitions and app, flashed at 0x0 for the first install) and the app image
+# for updates over the web page / OTA.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Version must match the tag
+        run: |
+          version=$(sed -n 's/^#define FW_VERSION "\(.*\)"/\1/p' src/config.h)
+          if [ "v$version" != "${{ github.ref_name }}" ]; then
+            echo "src/config.h has $version, the tag is ${{ github.ref_name }}"; exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ hashFiles('platformio.ini') }}
+
+      - name: PlatformIO (pioarduino core matching the platform, see CLAUDE.md)
+        run: pip install --quiet "pioarduino==6.1.19"
+
+      - name: Build
+        run: pio run -e esp32s3-n16r8
+
+      - name: Release files
+        run: |
+          mkdir dist
+          cp .pio/build/esp32s3-n16r8/firmware.factory.bin "dist/battbench-esp-$VERSION-factory.bin"
+          cp .pio/build/esp32s3-n16r8/firmware.bin "dist/battbench-esp-$VERSION-update.bin"
+          {
+            git log -1 --format=%b | grep -v '^Co-Authored-By:'
+            echo
+            echo '### Install'
+            echo "- **First install** (USB): flash \`battbench-esp-$VERSION-factory.bin\` at address \`0x0\`, e.g. with"
+            echo "  \`esptool.py --chip esp32s3 write_flash 0x0 battbench-esp-$VERSION-factory.bin\` or in the browser with"
+            echo "  Espressif's web flasher https://espressif.github.io/esptool-js/ (Chrome / Edge, flash address 0x0)."
+            echo "- **Update**: upload \`battbench-esp-$VERSION-update.bin\` on the web page (*Settings → Firmware update*);"
+            echo '  the stored readings and settings stay.'
+          } > notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* --title "BattBench-ESP $VERSION" --notes-file notes.md

@@ -1,0 +1,292 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BattBench-ESP</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1d2228;--mut:#6b7480;--line:#dde1e6;--acc:#2f6fd6;--ok:#2e9d55;--warn:#d98a1c;--err:#cf3b3b;--chg:#e05a2a;--dis:#2f6fd6}
+@media (prefers-color-scheme:dark){:root{--bg:#15181c;--card:#1f2328;--fg:#e6e8eb;--mut:#9aa3ad;--line:#343a42;--acc:#6c9ef0}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--card);border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:18px;margin:0;font-weight:650}
+header .dot{width:10px;height:10px;border-radius:50%;background:var(--mut);display:inline-block;margin-right:6px}
+nav{display:flex;gap:4px;margin-left:auto;flex-wrap:wrap}
+nav button{background:none;border:0;padding:6px 12px;border-radius:6px;color:var(--fg);font:inherit;cursor:pointer}
+nav button.on{background:var(--acc);color:#fff}
+main{max-width:1240px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:14px}
+.card h2{font-size:15px;margin:0 0 10px;font-weight:650}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.grid3>.card{margin-bottom:0}
+@media (max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.grid3{grid-template-columns:1fr}.grid3>.card{margin-bottom:14px}}
+@media (max-width:480px){.grid{grid-template-columns:1fr}}
+.slot{border:1px solid var(--line);border-radius:10px;padding:12px;border-left:5px solid var(--mut)}
+.slot.charging{border-left-color:var(--chg)}.slot.discharging{border-left-color:var(--dis)}
+.slot.done{border-left-color:var(--ok)}.slot.error{border-left-color:var(--err)}
+.slot .big{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.slot .row{display:flex;justify-content:space-between;color:var(--mut);font-variant-numeric:tabular-nums}
+.slot .row b{color:var(--fg);font-weight:550}
+dl{display:grid;grid-template-columns:2fr 3fr;gap:4px 12px;margin:0}
+a{color:var(--acc)}dt{color:var(--mut)}dt[title]{cursor:help;text-decoration:underline dotted}dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+label{display:block;margin:10px 0 4px;color:var(--mut)}
+input,select{width:100%;max-width:420px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
+input[type=checkbox]{width:auto}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+button.b{padding:8px 14px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font:inherit;cursor:pointer}
+button.p{background:var(--acc);border-color:var(--acc);color:#fff}
+button.d{border-color:var(--err);color:var(--err)}
+table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:500}
+tr.pick{cursor:pointer}tr.pick:hover{background:var(--bg)}
+.bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin:4px 0 2px}.bar i{display:block;height:100%;background:var(--acc)}
+.mut{color:var(--mut)}.msg{margin-top:10px;min-height:1.4em}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>BattBench-ESP</h1>
+  <span id="hdr" class="mut"></span>
+  <nav>
+    <button data-tab="status" class="on" data-t="Status">Status</button>
+    <button data-tab="wifi" data-t="Wi-Fi">Wi-Fi</button>
+    <button data-tab="ble" data-t="Bluetooth">Bluetooth</button>
+    <button data-tab="store" data-t="Storage">Storage</button>
+    <button data-tab="settings" data-t="Settings">Settings</button>
+  </nav>
+</header>
+<main>
+<section id="status">
+  <div class="card"><h2 id="chgname" data-t="Charger">Charger</h2><div id="slots" class="grid"></div></div>
+  <div class="grid3">
+    <div class="card"><h2 data-t="Bluetooth">Bluetooth</h2><dl id="st_ble"></dl>
+      <div class="btns"><button class="b bp" data-t="Pause 5 min">Pause 5 min</button><button class="b bo"></button></div></div>
+    <div class="card"><h2 data-t="Wi-Fi">Wi-Fi</h2><dl id="st_wifi"></dl></div>
+    <div class="card"><h2 data-t="Storage">Storage</h2><dl id="st_store"></dl></div>
+  </div>
+</section>
+
+<section id="wifi" class="hidden">
+  <div class="card"><h2 data-t="Wi-Fi network">Wi-Fi network</h2>
+    <label data-t="Network (SSID)">Network (SSID)</label><input id="ssid" list="ssids" autocomplete="off">
+    <datalist id="ssids"></datalist>
+    <label data-t="Password">Password</label><input id="pass" type="password" autocomplete="new-password">
+    <label data-t="Host name (mDNS: name.local)">Host name (mDNS: name.local)</label><input id="hostname">
+    <label data-t="Password of the own access point (empty = open, at least 8 characters)">Password of the own access point</label>
+    <input id="ap_pass" type="password" autocomplete="new-password">
+    <div class="btns"><button class="b" id="wscan" data-t="Search networks">Search networks</button>
+      <button class="b p" id="wsave" data-t="Save and restart">Save and restart</button></div>
+    <div class="msg mut" id="wmsg"></div>
+    <table id="wlist"></table>
+  </div>
+</section>
+
+<section id="ble" class="hidden">
+  <div class="card"><h2 data-t="Charger">Charger</h2>
+    <label data-t="Bluetooth address (empty = first SkyRC charger found)">Bluetooth address</label>
+    <input id="ble_addr" placeholder="AA:BB:CC:DD:EE:FF">
+    <label data-t="Query interval (ms, all slots)">Query interval (ms, all slots)</label><input id="poll_ms" type="number" min="1000" max="60000" step="500">
+    <div class="btns"><button class="b bp" data-t="Pause 5 min">Pause 5 min</button><button class="b bo"></button></div>
+    <div class="btns"><button class="b" id="bscan" data-t="Search chargers">Search chargers</button>
+      <button class="b p" id="bsave" data-t="Save and reconnect">Save and reconnect</button></div>
+    <div class="msg mut" id="bmsg"></div>
+    <table id="blist"></table>
+    <p class="mut" data-t="blehint">The charger accepts only one Bluetooth connection: to use the SkyRC app or BattBench's own Bluetooth, pause Bluetooth here or switch it off. By itself the ESP sends only status queries; commands that start or stop a task come from BattBench (charge profiles) and only after a confirmation there.</p>
+  </div>
+</section>
+
+<section id="store" class="hidden">
+  <div class="card"><h2 data-t="Storage">Storage</h2>
+    <dl id="st_store2"></dl>
+    <p class="mut" data-t="storehint">RAM keeps every reading but loses them on a power loss. The flash log keeps one reading per slot every n seconds (see below; a change of state at once), writes each one right away and keeps them over a power loss. Fetching deletes nothing: both are ring buffers that drop their oldest readings when full, so BattBench should fetch before the range runs out. Before a restart (settings, update, button) the readings still held back are written to flash; a power loss loses at most the last n seconds per slot that BattBench has not fetched yet.</p>
+    <label><input type="checkbox" id="flash_log"> <span data-t="Write the flash log">Write the flash log</span></label>
+    <label data-t="Flash log: one reading per slot every n seconds (changes at once, 0 = all)">Flash log: one reading per slot every n seconds</label>
+    <input id="thin_secs" type="number" min="0" max="600">
+    <div class="btns"><button class="b p" id="ssave" data-t="Save">Save</button>
+      <button class="b d" id="sclear" data-t="Clear log">Clear log</button></div>
+    <div class="msg mut" id="smsg"></div>
+  </div>
+</section>
+
+<section id="settings" class="hidden">
+  <div class="card"><h2>BattBench-ESP</h2>
+    <dl id="st_about"></dl>
+    <label data-t="GPIO of the RGB LED (DevKitC-1: 48, board v1.1: 38; restart)">GPIO of the RGB LED</label>
+    <input id="led_gpio" type="number" min="0" max="48">
+    <div class="btns"><button class="b p" id="lsave" data-t="Save">Save</button>
+      <button class="b" id="reboot" data-t="Restart">Restart</button></div>
+    <div class="msg mut" id="lmsg"></div>
+  </div>
+  <div class="card"><h2 data-t="Firmware update">Firmware update</h2>
+    <p class="mut" data-t="otahint">The file battbench-esp-…-update.bin from the releases on GitHub. The stored readings and the settings stay.</p>
+    <input type="file" id="fw" accept=".bin">
+    <div class="btns"><button class="b" id="ota" data-t="Upload">Upload</button></div>
+    <div class="msg mut" id="omsg"></div>
+  </div>
+</section>
+</main>
+<script>
+const DE={"Status":"Status","Wi-Fi":"WLAN","Bluetooth":"Bluetooth","Storage":"Speicher","Charger":"Ladegerät",
+"Wi-Fi network":"WLAN-Netz","Network (SSID)":"Netz (SSID)","Password":"Passwort","Host name (mDNS: name.local)":"Hostname (mDNS: name.local)",
+"Password of the own access point (empty = open, at least 8 characters)":"Passwort des eigenen Access Points (leer = offen, mind. 8 Zeichen)",
+"Search networks":"Netze suchen","Save and restart":"Speichern und neu starten",
+"Bluetooth address (empty = first SkyRC charger found)":"Bluetooth-Adresse (leer = erstes gefundenes SkyRC-Ladegerät)",
+"Query interval (ms, all slots)":"Abfrageintervall (ms, alle Schächte)","Search chargers":"Ladegeräte suchen","Save and reconnect":"Speichern und neu verbinden",
+"blehint":"Das Ladegerät nimmt nur eine Bluetooth-Verbindung an: Für die SkyRC-App oder das eigene Bluetooth von BattBench hier Bluetooth pausieren oder ausschalten. Von selbst sendet der ESP nur Statusabfragen; Befehle, die einen Vorgang starten oder stoppen, kommen von BattBench (Ladeprofile) und nur nach einer Bestätigung dort.",
+"Write the flash log":"Flash-Log schreiben","Flash log: one reading per slot every n seconds (changes at once, 0 = all)":"Flash-Log: ein Messwert pro Schacht alle n Sekunden (Änderungen sofort, 0 = alle)",
+"Save":"Speichern","Settings":"Einstellungen","Version":"Version","Source code":"Quellcode","Releases":"Releases",
+"otahint":"Die Datei battbench-esp-…-update.bin aus den Releases auf GitHub. Die gespeicherten Messwerte und die Einstellungen bleiben erhalten.","GPIO of the RGB LED (DevKitC-1: 48, board v1.1: 38; restart)":"GPIO der RGB-LED (DevKitC-1: 48, Board v1.1: 38; Neustart)","Clear log":"Log löschen","Restart":"Neu starten","Firmware update":"Firmware-Update","Upload":"Hochladen",
+"empty":"leer","idle":"bereit","charging":"lädt","discharging":"entlädt","done":"fertig","error":"Fehler","input voltage too low":"Eingangsspannung zu niedrig","input voltage too high":"Eingangsspannung zu hoch",
+"contact lost":"Kontakt verloren","capacity limit reached":"Kapazitätsgrenze erreicht","time limit reached":"Zeitgrenze erreicht",
+"internal temperature too high":"Gerät zu heiß","charger too hot":"Gerät zu heiß","battery too hot":"Akku zu heiß",
+"calibration failed":"Kalibrierung fehlgeschlagen","internal resistance too high":"Innenwiderstand zu hoch",
+"wrong battery type":"Falscher Akkutyp","overload":"Überlast","reversed polarity":"Verpolt","battery already full":"Akku schon voll","short circuit":"Kurzschluss",
+"check voltage":"Spannung prüfen","pause":"Pause",
+"State":"Zustand","Address":"Adresse","Connected for":"Verbunden seit","Answers / missed":"Antworten / verpasst","Last answer":"Letzte Antwort","Last error":"Letzter Fehler",
+"Network":"Netz","IP":"IP","Signal":"Signal","Access point":"Access Point","on":"an","off":"aus","not connected":"nicht verbunden",
+"Readings in RAM":"Messwerte im RAM","RAM reaches back to":"RAM reicht zurück bis","Flash log":"Flash-Log","Flash reaches back to":"Flash reicht zurück bis",
+"Bytes per reading":"Bytes pro Messwert","Estimated range":"Geschätzte Reichweite",
+"Connected":"Verbunden","Answers":"Antworten","Last answer":"Letzte Antw.","Error":"Fehler","Own AP":"Eigener AP",
+"Free RAM":"Freier RAM","RAM":"RAM","RAM since":"RAM ab","Flash":"Flash","Flash since":"Flash ab",
+"Bytes/reading":"Bytes/Wert","Pause 5 min":"5 Min. pausieren","Charger not connected":"Ladegerät nicht verbunden","Switch off":"Ausschalten","Switch on":"Einschalten",
+"paused":"pausiert","off":"aus","Resume now":"Jetzt fortsetzen","left":"übrig",
+"Free memory":"Freier Speicher","scanning":"sucht","connecting":"verbindet","connected":"verbunden","waiting":"wartet","starting":"startet",
+"Name":"Name","Model":"Modell","no data":"keine Daten","Saved.":"Gespeichert.","Restarting …":"Startet neu …","Searching …":"Suche …",
+"Clear the whole log (RAM and flash)?":"Das ganze Log (RAM und Flash) löschen?","Log cleared.":"Log gelöscht.","Uploading …":"Lade hoch …",
+"ago":"her","days":"Tage","hours":"Std.","Log id":"Log-ID","Next number":"Nächste Nummer","Select":"Übernehmen","off (charger only in RAM)":"aus (nur RAM)",
+"Range":"Reichweite","never":"noch nie","(before restart)":"(vor Neustart)","before the restart":"vor dem Neustart","nothing, all fetched":"nichts, alles abgerufen",
+"readings":"Messwerte","only 1 per minute":"nur 1 pro Minute","only 1 every":"nur 1 alle","before":"vor","oldest":"ältester","Fetched":"Abgerufen","Not fetched":"Offen",
+"Flash every":"Flash alle","per slot":"pro Schacht","every reading":"jeder Messwert",
+"Every reading (each slot every poll interval). Lost on a power loss.":"Jeder Messwert (jeder Schacht in jedem Abfrage-Intervall). Geht bei Stromausfall verloren.",
+"Oldest reading in RAM":"Ältester Messwert im RAM","Thinned readings, written right away, kept over a power loss":"Ausgedünnte Messwerte, sofort geschrieben, bleiben bei Stromausfall erhalten",
+"Oldest reading in flash with a known time":"Ältester Messwert im Flash mit bekannter Uhrzeit",
+"Last time BattBench fetched readings. Fetching deletes nothing.":"Letzter Abruf durch BattBench. Abrufen löscht nichts.",
+"Readings BattBench does not have yet":"Messwerte, die BattBench noch nicht hat","Changes of state are written at once":"Statuswechsel werden sofort geschrieben",
+"How far the flash log reaches back once it is full":"Wie weit das Flash-Log zurückreicht, wenn es voll ist",
+"storehint":"Der RAM hält jeden Messwert, verliert sie aber bei Stromausfall. Das Flash-Log hält einen Messwert pro Schacht alle n Sekunden (Einstellung unten; Statuswechsel sofort), schreibt jeden sofort und behält sie bei Stromausfall. Abrufen löscht nichts: beide sind Ringpuffer, die bei vollem Speicher die ältesten Messwerte verwerfen; BattBench sollte also abrufen, bevor die Reichweite abläuft. Vor einem Neustart (Einstellungen, Update, Knopf) werden die noch zurückgehaltenen Messwerte ins Flash geschrieben; ein Stromausfall verliert höchstens die letzten n Sekunden pro Schacht, die BattBench noch nicht abgerufen hat.","missed":"verpasst","Clock":"Uhrzeit","not set":"nicht gestellt","Uptime":"Laufzeit"};
+const de=(navigator.language||'').startsWith('de');
+const t=s=>de&&DE[s]?DE[s]:s;
+document.querySelectorAll('[data-t]').forEach(e=>e.textContent=t(e.dataset.t));
+const $=id=>document.getElementById(id);
+const api=async(p,o)=>{const r=await fetch(p,o);if(!r.ok)throw new Error(await r.text());return r.json()};
+const post=(p,b)=>api(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const dur=s=>{s=Math.max(0,Math.round(s));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+  return (d?d+'d ':'')+(d||h?h+'h ':'')+m+'m'};
+const hms=s=>{s=Math.round(s);return Math.floor(s/3600)+':'+String(Math.floor(s%3600/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')};
+const LOC=de?'de-DE':'en-GB',H24={hour:'2-digit',minute:'2-digit',hourCycle:'h23'};   // 24 h in both languages
+const ts=x=>x?new Date(x*1000).toLocaleString(LOC,{day:'2-digit',month:'2-digit',...H24}):'–';
+const dl=(el,rows)=>{$(el).innerHTML=rows.map(([k,v,h])=>`<dt${h?` title="${esc(t(h))}"`:''}>${esc(t(k))}</dt><dd>${v}</dd>`).join('')};
+const ago=x=>de?'vor '+x:x+' ago';
+const num=x=>Number(x).toLocaleString(LOC);
+let tab='status';
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{tab=b.dataset.tab;
+  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on',x===b));
+  document.querySelectorAll('main section').forEach(s=>s.classList.toggle('hidden',s.id!==tab));
+  if(tab==='ble')loadBle();});
+
+function storeRows(s,st){
+  const bpr=s.flash_recs?s.flash_bytes/s.flash_recs:0;
+  const usedPct=s.flash_sectors?100*s.flash_used/s.flash_sectors:0;
+  const mb=x=>(x*4096/1048576).toFixed(1);
+  let range='–';
+  if(s.flash_first_t&&st.now&&s.flash_timed>2){const span=st.now-s.flash_first_t;range='≈ '+(span*s.flash_sectors/s.flash_timed/86400).toFixed(1)+' '+t('days')}
+  // last fetch by BattBench (also from before a restart) and what it does not have yet
+  let fetched=t('never');
+  if(s.fetch_secs>=0)fetched=ago(s.fetch_secs<120?s.fetch_secs+' s':dur(s.fetch_secs))+(s.fetch_ip?' · '+esc(s.fetch_ip):'');
+  else if(s.fetch_t)fetched=ts(s.fetch_t)+' '+t('(before restart)');
+  else if(s.fetched_seq)fetched=t('before the restart');
+  let open=t('nothing, all fetched');
+  if(s.open>0){
+    const age=s.open_first_secs>=0?s.open_first_secs:(s.open_first_t&&st.now?st.now-s.open_first_t:-1);
+    // part of them only in flash: there just one per slot every thin_secs (RAM, with every reading, begins at ram_first_t)
+    const per=s.thin_secs===60?t('only 1 per minute'):`${t('only 1 every')} ${s.thin_secs} s`;
+    const hm=x=>new Date(x*1000).toDateString()===new Date().toDateString()
+      ?new Date(x*1000).toLocaleTimeString(LOC,H24):ts(x);
+    open=(s.open_exact?'':'≈ ')+`${num(s.open)} ${t('readings')}`
+      +(s.open_exact||!s.thin_secs?'':` (${s.ram_count&&s.ram_first_t?t('before')+' '+hm(s.ram_first_t)+' ':''}${per})`)
+      +(s.open_first_t?` · ${t('oldest')} ${ts(s.open_first_t)}`:'')+(age>=60?` (${ago(dur(age))})`:'');
+  }
+  return [['RAM',`${num(s.ram_count)} / ${num(s.ram_cap)} ${t('readings')}<div class="bar"><i style="width:${100*s.ram_count/s.ram_cap}%"></i></div>`,
+     'Every reading (each slot every poll interval). Lost on a power loss.'],
+   ['RAM since',ts(s.ram_first_t),'Oldest reading in RAM'],
+   ['Flash',s.flash_log?`${mb(s.flash_used)} / ${mb(s.flash_sectors)} MB<div class="bar"><i style="width:${usedPct}%"></i></div>`:t('off (charger only in RAM)'),
+     'Thinned readings, written right away, kept over a power loss'],
+   ['Flash since',ts(s.flash_first_t),'Oldest reading in flash with a known time'],
+   ['Fetched',fetched,'Last time BattBench fetched readings. Fetching deletes nothing.'],
+   ['Not fetched',open,'Readings BattBench does not have yet'],
+   ['Flash every',s.thin_secs?`${s.thin_secs} s ${t('per slot')}`:t('every reading'),'Changes of state are written at once'],
+   ['Bytes/reading',bpr?bpr.toFixed(1):'–'],['Range',range,'How far the flash log reaches back once it is full'],
+   ['Log id',s.logid],['Next number',num(s.seq_next)]];
+}
+async function refresh(){
+  let s;try{s=await api('/api/status')}catch(e){$('hdr').textContent='offline';return}
+  const b=s.ble,w=s.wifi;
+  $('hdr').innerHTML=`<span class="dot" style="background:var(${b.state==='connected'?'--ok':'--warn'})"></span>${esc(b.state==='connected'?b.model+' '+b.addr:t(b.state))}`;
+  $('chgname').textContent=b.state==='connected'?`${b.model} · ${b.name||b.addr}`:t('Charger');
+  // no slot values while the charger is not connected / not answering: they would be old
+  const online=b.state==='connected'&&b.last_answer_secs>=0&&b.last_answer_secs<=30;
+  $('slots').classList.toggle('grid',online);
+  $('slots').innerHTML=online&&s.slots.length?s.slots.map((x,i)=>{
+    if(!x)return `<div class="slot"><b>${i+1}</b> <span class="mut">${t('no data')}</span></div>`;
+    return `<div class="slot ${x.state}"><div class="row"><b>${i+1} · ${esc(x.type)}</b><span>${esc(t(x.error||x.state))}</span></div>
+     <div class="big">${(x.mv/1000).toFixed(3)} V</div>
+     <div class="row"><span>${x.ma} mA</span><span>${x.mah} mAh</span></div>
+     <div class="row"><span>${x.res?x.res+' mΩ':'–'}</span><span>${x.temp?x.temp+' °C':''}</span><span>${hms(x.secs)}</span></div></div>`}).join('')
+    :`<span class="mut">${t('Charger not connected')} (${esc(t(b.state))}${b.paused_secs?' · '+dur(b.paused_secs)+' '+t('left'):''})</span>`;
+  document.querySelectorAll('.bp').forEach(x=>{x.textContent=b.paused_secs?t('Resume now'):t('Pause 5 min');x.disabled=!b.on;
+    x.onclick=()=>post('/api/ble',{pause:b.paused_secs?0:5}).then(refresh)});
+  document.querySelectorAll('.bo').forEach(x=>{x.textContent=b.on?t('Switch off'):t('Switch on');
+    x.onclick=()=>post('/api/ble',{on:!b.on}).then(refresh)});
+  dl('st_ble',[['Status',esc(t(b.state))+(b.paused_secs?` · ${dur(b.paused_secs)} ${t('left')}`:'')],['Address',esc(b.addr||'–')],['Connected',b.connected_secs?dur(b.connected_secs):'–'],
+    ['Answers',`${b.answers} · ${b.misses} ${t('missed')}`],['Last answer',b.last_answer_secs>=0?b.last_answer_secs+' s '+t('ago'):'–'],
+    ['Error',esc(b.error||'–')]]);
+  dl('st_wifi',[['Network',esc(w.ssid||'–')+(w.connected?'':' ('+t('not connected')+')')],['IP',esc(w.ip||'–')+(w.ip?` · ${esc(w.hostname)}.local`:'')],
+    ['Signal',w.connected?w.rssi+' dBm':'–'],['Own AP',w.ap?esc(w.ap_ssid)+' · 192.168.4.1':t('off')],
+    ['Clock',s.clock_ok?ts(s.now):t('not set')],['Uptime',dur(s.uptime)],
+    ['Free RAM',`${Math.round(s.heap_internal/1024)} KB · PSRAM ${(s.psram/1048576).toFixed(1)} MB`]]);
+  const rows=storeRows(s.store,s);dl('st_store',rows.slice(0,6));dl('st_store2',rows);
+  const gh='https://github.com/fashberg/battbench-esp';
+  dl('st_about',[['Version',esc(s.fw)],['Source code',`<a href="${gh}" target="_blank" rel="noopener">${gh.slice(8)}</a>`],
+    ['Releases',`<a href="${gh}/releases" target="_blank" rel="noopener">${gh.slice(8)}/releases</a>`]]);
+}
+async function loadCfg(){
+  const c=await api('/api/config');
+  ['ssid','hostname','ble_addr','poll_ms','thin_secs','led_gpio'].forEach(k=>$(k).value=c[k]);
+  $('flash_log').checked=c.flash_log;
+  $('pass').placeholder=c.pass_set?'••••••••':'';$('ap_pass').placeholder=c.ap_pass_set?'••••••••':'';
+}
+$('wscan').onclick=async()=>{$('wmsg').textContent=t('Searching …');
+  try{const l=await api('/api/wifiscan');$('wmsg').textContent='';
+    $('ssids').innerHTML=l.map(n=>`<option value="${esc(n.ssid)}">`).join('');
+    $('wlist').innerHTML=`<tr><th>${t('Network')}</th><th>${t('Signal')}</th></tr>`+l.map(n=>`<tr class="pick" data-s="${esc(n.ssid)}"><td>${esc(n.ssid)}${n.open?' 🔓':''}</td><td>${n.rssi} dBm</td></tr>`).join('');
+    document.querySelectorAll('#wlist tr.pick').forEach(r=>r.onclick=()=>{$('ssid').value=r.dataset.s;$('pass').focus()});
+  }catch(e){$('wmsg').textContent=e.message}};
+$('wsave').onclick=async()=>{const b={ssid:$('ssid').value,hostname:$('hostname').value};
+  if($('pass').value)b.pass=$('pass').value; if($('ap_pass').value)b.ap_pass=$('ap_pass').value;
+  try{const r=await post('/api/config',b);$('wmsg').textContent=r.msg==='restart'?t('Restarting …'):t('Saved.')}catch(e){$('wmsg').textContent=e.message}};
+async function loadBle(){
+  const l=await api('/api/blescan');
+  $('blist').innerHTML=l.length?`<tr><th>${t('Name')}</th><th>${t('Address')}</th><th>${t('Model')}</th><th>${t('Signal')}</th></tr>`+
+    l.map(d=>`<tr class="pick" data-a="${d.addr}"><td>${esc(d.name||'?')}</td><td>${d.addr}</td><td>${esc(d.model||'?')}</td><td>${d.rssi} dBm · ${d.age} s</td></tr>`).join(''):'';
+  document.querySelectorAll('#blist tr.pick').forEach(r=>r.onclick=()=>$('ble_addr').value=r.dataset.a);
+}
+$('bscan').onclick=async()=>{await post('/api/blescan');$('bmsg').textContent=t('Searching …');
+  setTimeout(async()=>{await loadBle();$('bmsg').textContent=''},7000)};
+$('bsave').onclick=async()=>{try{await post('/api/config',{ble_addr:$('ble_addr').value.trim().toUpperCase(),poll_ms:+$('poll_ms').value});
+  $('bmsg').textContent=t('Saved.')}catch(e){$('bmsg').textContent=e.message}};
+$('ssave').onclick=async()=>{try{await post('/api/config',{thin_secs:+$('thin_secs').value,flash_log:$('flash_log').checked});
+  $('smsg').textContent=t('Saved.')}catch(e){$('smsg').textContent=e.message}};
+$('lsave').onclick=async()=>{try{await post('/api/config',{led_gpio:+$('led_gpio').value});
+  $('lmsg').textContent=t('Saved.')}catch(e){$('lmsg').textContent=e.message}};
+$('sclear').onclick=async()=>{if(!confirm(t('Clear the whole log (RAM and flash)?')))return;await post('/api/clear');$('smsg').textContent=t('Log cleared.')};
+$('reboot').onclick=async()=>{await post('/api/reboot');$('lmsg').textContent=t('Restarting …')};
+$('ota').onclick=async()=>{const f=$('fw').files[0];if(!f)return;$('omsg').textContent=t('Uploading …');
+  try{const r=await fetch('/api/ota',{method:'POST',body:f});$('omsg').textContent=r.ok?t('Restarting …'):await r.text()}catch(e){$('omsg').textContent=e.message}};
+loadCfg();refresh();setInterval(()=>{if(tab!=='wifi')refresh()},2000);
+</script>
+</body>
+</html>
