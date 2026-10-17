@@ -9,6 +9,7 @@
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mdns.h"
@@ -135,6 +136,7 @@ void net_start(void)
         ESP_LOGW(TAG, "Wi-Fi power save off not possible (%s), modem sleep", esp_err_to_name(ps));
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     }
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);   // Bluetooth only asks for a status twice a second
 
     esp_sntp_config_t sc = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     sc.sync_cb = on_sntp;

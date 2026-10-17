@@ -1,5 +1,5 @@
-// Readings: every reading in a ring buffer in PSRAM (lost on power off), a thinned and compressed log in the
-// "bblog" flash partition (kept). Each reading gets a sequence number that never goes back (also across
+// Readings: every reading in a compressed ring buffer in PSRAM (lost on power off), a thinned and compressed log in
+// the "bblog" flash partition (kept). Each reading gets a sequence number that never goes back (also across
 // reboots); BattBench asks for everything after the last number it has. Recent numbers come from RAM (every
 // reading), older ones from flash (only the thinned readings: numbers have gaps there).
 //
@@ -13,6 +13,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "config.h"
 #include "esp_err.h"
 
 #define REC_RAW_MAX 28
@@ -31,8 +32,10 @@ typedef struct {
 typedef struct {
     uint32_t logid;             // changes when the log is cleared
     uint32_t seq_next;
-    uint32_t ram_cap, ram_count, ram_first_seq;
+    uint32_t ram_cap, ram_count, ram_first_seq;   // ram_cap: estimated from the bytes per reading so far
     uint32_t ram_first_up10;
+    uint32_t ram_bytes, ram_bytes_cap;  // compressed size of the readings in RAM, size of the ring
+    bool ram_full;              // the oldest readings in RAM have been dropped
     uint32_t flash_sectors, flash_used, flash_first_seq;
     uint16_t flash_first_boot;  // oldest sector whose boot has a known clock (older ones cannot be dated)
     uint32_t flash_first_up10;
@@ -41,9 +44,43 @@ typedef struct {
     bool flash_ok;
     bool clock_set;
     uint32_t fetched_seq;       // BattBench has the readings up to this number (also from before a restart)
+    uint32_t ram_open;          // readings in RAM BattBench has not fetched yet
+    uint32_t flash_open;        // flash sectors (of flash_used) with readings it has not fetched yet
     int32_t fetch_secs;         // since the last fetch in this boot, -1 = none yet
     double fetch_t;             // unix time of the last fetch (also from before a restart), 0 = unknown
 } store_stats_t;
+
+// Record coding, shared by the flash log, the RAM ring and the binary fetch (/api/records?fmt=bin):
+//   tag:   0 F SSS LLL  (F = full packet, S = charger index, L = slot); 0x80-0xFF: no record (end, or a marker)
+//   varint seq - previous seq, varint up10 - previous up10 (first record: relative to the base)
+//   full:  length, packet
+//   delta: (same length as the previous packet of this charger / slot) bit mask of the changed bytes (1 bit per
+//          byte, LSB first), then the changed bytes
+#define STORE_ENC_MAX (1 + 2 * 5 + 1 + REC_RAW_MAX)
+typedef struct {
+    uint32_t seq, up10;         // of the previous record (or the base)
+    uint8_t len[MAX_CHARGERS * 8];
+    uint8_t raw[MAX_CHARGERS * 8][REC_RAW_MAX];
+} store_coder_t;
+void store_coder_reset(store_coder_t *c, uint32_t seq, uint32_t up10);
+// Appends r (seq and up10 not lower than the previous record's) to buf, returns the bytes written.
+int store_encode(store_coder_t *c, const rec_t *r, uint8_t *buf);
+
+// Binary fetch (/api/records?fmt=bin), little endian:
+//   header:  "BBR1", u32 log id, u32 seq_next, u8 more, u32 number of records
+//   segment: 0x80, u16 boot, u8 clock known, i64 off10 (see store_off10), u32 seq, u32 up10 (base of the coding);
+//            then the records of that boot, coded as above
+//   0xFF ends it. Unix time of a record = (off10 + up10) / 10 if the clock of its boot is known.
+#define STORE_BIN_HDR 17
+#define STORE_STREAM_MAX (20 + STORE_ENC_MAX)
+typedef struct {
+    store_coder_t c;
+    bool open;
+    uint16_t boot;
+} store_stream_t;
+int store_bin_header(uint8_t *buf, uint32_t logid, uint32_t seq_next, bool more, uint32_t count);
+// Appends r (a segment first if needed) to buf (room for STORE_STREAM_MAX bytes), returns the bytes written.
+int store_stream_put(store_stream_t *st, const rec_t *r, uint8_t *buf);
 
 void store_init(void);
 uint32_t store_uptime10(void);
@@ -54,6 +91,8 @@ int store_read(uint32_t since, int max, rec_t *out, bool *more);
 bool store_live(uint8_t src, uint8_t slot, rec_t *out);
 // Unix time of a record time stamp; false if the clock of that boot is unknown.
 bool store_unix(uint16_t boot, uint32_t up10, double *t);
+// Unix time in 0.1 s minus uptime in 0.1 s of that boot; false if its clock is unknown.
+bool store_off10(uint16_t boot, int64_t *off10);
 void store_clock_set(void);               // the system clock is now right (SNTP / BattBench)
 bool store_clock_ok(void);
 void store_stats(store_stats_t *s);

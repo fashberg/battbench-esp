@@ -28,3 +28,9 @@ CONFIG_HTTPD_MAX_URI_LEN=512
 CONFIG_LWIP_LOCAL_HOSTNAME="battbench-esp"
 CONFIG_LWIP_MAX_SOCKETS=16
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# Wi-Fi keeps modem sleep next to Bluetooth (~100 ms per round trip): a larger TCP window sends a batch of
+# readings in a few round trips instead of one per 4 segments
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=23040
+CONFIG_LWIP_TCP_WND_DEFAULT=23040
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=16

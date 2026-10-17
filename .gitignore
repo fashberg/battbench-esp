@@ -6,3 +6,5 @@ managed_components/
 dependencies.lock
 test/host/test
 test/host/n8.csv
+test/host/records.bin
+test/host/records.txt

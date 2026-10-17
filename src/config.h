@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-#define FW_VERSION "2026.10.1"
+#define FW_VERSION "2026.10.4"
 #define MAX_CHARGERS 8          // records carry a 3-bit charger index ("src")
 
 typedef struct {

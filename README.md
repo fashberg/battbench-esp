@@ -113,7 +113,7 @@ slot tiles.
 
 | Level | Content | Size | Lasts (4 occupied slots) |
 |---|---|---|---|
-| RAM ring (PSRAM) | every answer, 44 bytes | 5 MB ≈ 119,000 readings | ≈ 16 h at a query every 2 s |
+| RAM ring (PSRAM) | every answer, compressed | 5 MB ≈ 500,000 readings | ≈ 3 days at a query every 2 s |
 | Flash log | thinned + compressed | 9.9 MB (2528 sectors of 4 KB) | ≈ 5 months (60 s, default); ≈ 4 weeks at 10 s; ≈ 6 days unthinned |
 
 - **Thinning** as `db.SampleThinner` in BattBench: at most one reading per slot every `thin_secs` (default 60 s,
@@ -121,8 +121,8 @@ slot tiles.
   written at once, together with the reading before it and the last one under load. Empty slots only once. While
   BattBench fetches all the time it gets every reading from RAM (and stores one every 10 s itself); the flash log
   only bridges times without fetching, one point per minute is enough there.
-- **Compression**: per sector and slot one full packet, after that only the changed bytes (bit mask + bytes),
-  sequence and time step as varints. Measured with 5.2 days of real charger data: **≈ 10 bytes per reading** instead
+- **Compression** (flash and RAM, in blocks of 4 KB): per block and slot one full packet, after that only the
+  changed bytes (bit mask + bytes), sequence and time step as varints. Measured with 5.2 days of real charger data: **≈ 10 bytes per reading** instead
   of 23 + time (host test, see below).
 - Estimate: 4 slots, 60 s → 0.067 readings/s × 11 B ≈ 65 KB/day (plus status changes) → 9.9 MB ≈ 5 months; at 10 s:
   0.4 readings/s × 10 B ≈ 350 KB/day → ≈ 28 days. A charger that does nothing (empty slots) writes almost nothing.
@@ -162,8 +162,9 @@ BattBench skips them.
 | | |
 |---|---|
 | `GET /api/info` | firmware, `logid`, `now` (0 = clock not set), `src` (current charger), `chargers` [{src, model, addr}] |
-| `GET /api/status` | Wi-Fi, Bluetooth (`state`, `on`, `paused_secs` …), storage, live values of the slots (for the web page) |
-| `GET /api/records?since=N&max=M` | `{logid, seq_next, more, records: [[seq, unix time / null, src, slot, "hex"], …]}`, max 1000 |
+| `GET /api/status` | Wi-Fi (`ps` = power save), Bluetooth (`state`, `on`, `paused_secs`, `itvl_ms` …), storage, live values of the slots (for the web page) |
+| `GET /api/records?since=N&max=M` | `{logid, seq_next, more, records: [[seq, unix time / null, src, slot, "hex"], …]}`, max 5000; deflated (zlib, ~5 times smaller) with `Accept-Encoding: deflate` |
+| `GET /api/records?…&fmt=bin` | the same readings binary, coded as in the flash log (format in `src/store.h`): ≈ 10 bytes per reading, ≈ 7 deflated, instead of ≈ 72 / 18 as JSON. BattBench uses it |
 | `GET/POST /api/config` | settings (passwords are not returned) |
 | `GET /api/wifiscan`, `GET/POST /api/blescan` | networks / SkyRC chargers in range |
 | `POST /api/time` | `{"t": unix}`, only while there is no SNTP |

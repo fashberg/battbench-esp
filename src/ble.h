@@ -22,6 +22,7 @@ typedef struct {
     uint8_t model;
     int src;                    // charger index of the records (-1 = none yet)
     int mtu;
+    int itvl_ms;                // connection interval
     uint32_t connected_up10;    // since (uptime)
     uint32_t answers, misses;   // status queries since boot
     uint32_t last_answer_up10;

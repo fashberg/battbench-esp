@@ -55,14 +55,17 @@ User documentation: `README.md`. The BattBench side is `battbench/device_net.py`
 - Sequence numbers only grow (blocks of 10,000 reserved in NVS); BattBench stores the last one saved per `logid` in
   its database (`settings`, key `esp:<logid>`). `POST /api/clear` starts a new `logid`.
 - The packets in `/api/records` are the charger's own answers; BattBench decodes them with
-  `device_skyrc.SkyCharger.sample`. The charger gets the same device key as over direct Bluetooth
+  `device_skyrc.SkyCharger.sample`. BattBench asks with `fmt=bin` (binary, delta coded like the flash log, format in
+  `src/store.h`, decoded by `device_net.decode_records`); without it the answer is JSON (older BattBench). The charger gets the same device key as over direct Bluetooth
   (`MC5000-ble-<address>`).
 - BattBench reads `/api/status` (`ble.state`, `on`, `paused_secs`) every 10 s to show and mirror a Bluetooth pause.
 
 ## Tests
 - Host test of `store.c` and `charger.c`: `test/host` (gcc in WSL / Linux, stubs for flash / NVS / timer with NOR
   semantics). `python make_csv.py [battbench.db]` on Windows writes `n8.csv` from a BattBench database (not in the
-  repository), then `./run.sh` in WSL. Covers 83,000 readings over 5.2 days, restarts (power cut / `store_flush`),
-  overflow of a small flash, thinning 0 / 10 / 60 s, the estimate of unfetched readings.
+  repository), then `./run.sh` in WSL; afterwards `python test_bin.py <BattBench checkout>` decodes the binary fetch
+  format written by the test (`records.bin`) with BattBench's `device_net.decode_records`. Covers 83,000 readings
+  over 5.2 days, restarts (power cut / `store_flush`), overflow of a small flash and of the RAM ring, thinning
+  0 / 10 / 60 s, the estimate of unfetched readings.
 - On the device: test commands are read-only unless the user asks otherwise (`91`, `98`, `5F`, `96`); never `FE 00`,
   `97`, `60` / `88` (bootloader).

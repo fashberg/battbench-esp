@@ -18,9 +18,9 @@ static const char *TAG = "store";
 static SemaphoreHandle_t lock;
 
 #ifndef RAM_BYTES
-#define RAM_BYTES (5 * 1024 * 1024)     // PSRAM ring; ~120000 readings = ~16 h of 4 slots every 2 s
+#define RAM_BYTES (5 * 1024 * 1024)     // PSRAM ring, compressed: ~10 bytes per reading = ~3 days of 4 slots every 2 s
 #endif
-#define RAM_FALLBACK 1000               // no PSRAM
+#define RAM_FALLBACK (8 * 4096)         // no PSRAM
 #define SEQ_BLOCK 10000                 // sequence numbers reserved in NVS at a time
 
 static uint32_t logid, seq_next, seq_reserved;
@@ -103,67 +103,28 @@ bool store_clock_ok(void)
     return clock_ok;
 }
 
-bool store_unix(uint16_t boot, uint32_t up10, double *t)
+bool store_off10(uint16_t boot, int64_t *off10)
 {
     for (int i = 0; i < ANCHORS; i++) {
         if (anchors[i].boot == boot && anchors[i].off10) {
-            *t = (anchors[i].off10 + up10) / 10.0;
+            *off10 = anchors[i].off10;
             return true;
         }
     }
     return false;
 }
 
-// ------------------------------------------------------------------ RAM ring
-static rec_t *ram;
-static uint32_t ram_cap, ram_start, ram_count;
-static rec_t live[MAX_CHARGERS][8];
-static bool live_ok[MAX_CHARGERS][8];
-
-static rec_t *ram_at(uint32_t i)
+bool store_unix(uint16_t boot, uint32_t up10, double *t)
 {
-    return &ram[(ram_start + i) % ram_cap];
+    int64_t off10;
+    if (!store_off10(boot, &off10)) {
+        return false;
+    }
+    *t = (off10 + up10) / 10.0;
+    return true;
 }
 
-// ------------------------------------------------------------------ flash log
-// Sector (4 KB): header, then records. A record is written body first and its tag byte last, so a record cut
-// by a power loss leaves the tag erased (0xFF) and ends the sector. Every boot starts a new sector.
-//   tag:   0 F SSS LLL  (F = full packet, S = charger index, L = slot); 0xFF = end
-//   varint seq - previous seq, varint up10 - previous up10 (first record: relative to the header)
-//   full:  length, packet
-//   delta: (same length as the previous packet of this charger / slot in the sector) bit mask of the changed
-//          bytes (1 bit per byte, LSB first), then the changed bytes
-#define SECTOR 4096
-#define MAGIC 0x314C4242u               // "BBL1"
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint32_t logid;
-    uint32_t sec_no;            // counts up, the oldest sector has the lowest number
-    uint32_t first_seq;
-    uint32_t up10_base;
-    uint16_t boot;
-    uint16_t rsv;
-} sec_hdr_t;
-
-typedef struct {
-    uint32_t sec_no;            // 0 = not part of the log
-    uint32_t first_seq;
-    uint32_t up10_base;
-    uint16_t boot;
-} sec_info_t;
-
-static const esp_partition_t *part;
-static uint32_t nsec;
-static sec_info_t *secs;
-static uint32_t sec_no_last, oldest_pos, used;    // used: sectors of the log, from oldest_pos on
-static bool cur_open;                              // a sector is being written (the newest one)
-static uint32_t cur_pos, wpos, prev_seq, prev_up10;
-static uint8_t prev_len[MAX_CHARGERS * 8];
-static uint8_t prev_raw[MAX_CHARGERS * 8][REC_RAW_MAX];
-static uint8_t *sbuf;                               // one sector for reading
-static uint32_t flash_recs, flash_bytes;
-static uint32_t last_written;                      // sequence number of the newest record in flash
-
+// ------------------------------------------------------------------ record coding (format in store.h)
 static int put_varint(uint8_t *p, uint32_t v)
 {
     int n = 0;
@@ -191,6 +152,263 @@ static bool get_varint(const uint8_t *p, uint32_t *off, uint32_t end, uint32_t *
     }
     return false;
 }
+
+void store_coder_reset(store_coder_t *c, uint32_t seq, uint32_t up10)
+{
+    c->seq = seq;
+    c->up10 = up10;
+    memset(c->len, 0, sizeof c->len);
+}
+
+// r coded after c's previous record, without changing c (see coder_note)
+static int coder_put(const store_coder_t *c, const rec_t *r, uint8_t *buf)
+{
+    int k = (r->src % MAX_CHARGERS) * 8 + r->slot % 8;
+    bool full = c->len[k] != r->len;
+    int n = 1;
+    n += put_varint(buf + n, r->seq - c->seq);
+    n += put_varint(buf + n, r->up10 - c->up10);
+    if (full) {
+        buf[n++] = r->len;
+        memcpy(buf + n, r->raw, r->len);
+        n += r->len;
+    } else {
+        int mbytes = (r->len + 7) / 8;
+        uint8_t *mask = buf + n;
+        memset(mask, 0, mbytes);
+        n += mbytes;
+        for (int i = 0; i < r->len; i++) {
+            if (r->raw[i] != c->raw[k][i]) {
+                mask[i / 8] |= 1 << (i % 8);
+                buf[n++] = r->raw[i];
+            }
+        }
+    }
+    buf[0] = (full ? 0x40 : 0) | (r->src & 7) << 3 | (r->slot & 7);
+    return n;
+}
+
+static void coder_note(store_coder_t *c, const rec_t *r)
+{
+    int k = (r->src % MAX_CHARGERS) * 8 + r->slot % 8;
+    c->seq = r->seq;
+    c->up10 = r->up10;
+    c->len[k] = r->len;
+    memcpy(c->raw[k], r->raw, r->len);
+}
+
+int store_encode(store_coder_t *c, const rec_t *r, uint8_t *buf)
+{
+    int n = coder_put(c, r, buf);
+    coder_note(c, r);
+    return n;
+}
+
+static int put_le(uint8_t *p, uint64_t v, int n)
+{
+    for (int i = 0; i < n; i++) {
+        p[i] = v >> (8 * i);
+    }
+    return n;
+}
+
+int store_bin_header(uint8_t *buf, uint32_t logid, uint32_t seq_next, bool more, uint32_t count)
+{
+    memcpy(buf, "BBR1", 4);
+    put_le(buf + 4, logid, 4);
+    put_le(buf + 8, seq_next, 4);
+    buf[12] = more;
+    put_le(buf + 13, count, 4);
+    return STORE_BIN_HDR;
+}
+
+int store_stream_put(store_stream_t *st, const rec_t *r, uint8_t *buf)
+{
+    int n = 0;
+    if (!st->open || st->boot != r->boot || r->seq <= st->c.seq || r->up10 < st->c.up10) {
+        int64_t off10 = 0;
+        bool known = store_off10(r->boot, &off10);
+        buf[n++] = 0x80;
+        n += put_le(buf + n, r->boot, 2);
+        buf[n++] = known;
+        n += put_le(buf + n, (uint64_t)off10, 8);
+        n += put_le(buf + n, r->seq, 4);
+        n += put_le(buf + n, r->up10, 4);
+        store_coder_reset(&st->c, r->seq, r->up10);
+        st->open = true;
+        st->boot = r->boot;
+    }
+    return n + store_encode(&st->c, r, buf + n);
+}
+
+// Next record at *off (before end) into r (seq, up10, src, slot, len, raw); false at the end or on broken data.
+static bool coder_get(store_coder_t *c, const uint8_t *p, uint32_t *off, uint32_t end, rec_t *r)
+{
+    uint32_t d1, d2;
+    if (*off >= end || (p[*off] & 0x80)) {
+        return false;
+    }
+    uint8_t tag = p[(*off)++];
+    int src = (tag >> 3) & 7, slot = tag & 7, k = src * 8 + slot;
+    if (!get_varint(p, off, end, &d1) || !get_varint(p, off, end, &d2)) {
+        return false;
+    }
+    if (tag & 0x40) {
+        if (*off >= end) {
+            return false;
+        }
+        uint8_t len = p[(*off)++];
+        if (len > REC_RAW_MAX || *off + len > end) {
+            return false;
+        }
+        memcpy(c->raw[k], p + *off, len);
+        c->len[k] = len;
+        *off += len;
+    } else {
+        int len = c->len[k], mbytes = (len + 7) / 8;
+        if (!len || *off + mbytes > end) {
+            return false;
+        }
+        const uint8_t *mask = p + *off;
+        *off += mbytes;
+        for (int i = 0; i < len; i++) {
+            if (mask[i / 8] & (1 << (i % 8))) {
+                if (*off >= end) {
+                    return false;
+                }
+                c->raw[k][i] = p[(*off)++];
+            }
+        }
+    }
+    c->seq += d1;
+    c->up10 += d2;
+    r->seq = c->seq;
+    r->up10 = c->up10;
+    r->src = src;
+    r->slot = slot;
+    r->len = c->len[k];
+    memcpy(r->raw, c->raw[k], r->len);
+    return true;
+}
+
+// ------------------------------------------------------------------ RAM ring
+// Every reading of this boot, coded as above in blocks of RBLK bytes (each starts with a full packet per slot);
+// when the ring is full the oldest block goes. Sequence numbers in RAM have no gaps.
+#define RBLK 4096
+typedef struct {
+    uint32_t first_seq, up10_base;
+    uint16_t used;              // bytes
+} rblk_t;
+static uint8_t *rdata;
+static rblk_t *rblk;
+static uint32_t rnblk, roldest, rused, rcur;      // rused: blocks in use from roldest on, rcur: the newest
+static bool rfull;
+static uint32_t rrecs, rbytes;                     // coded since the ring was last empty (bytes per reading)
+static store_coder_t renc, rdec;
+static rec_t live[MAX_CHARGERS][8];
+static bool live_ok[MAX_CHARGERS][8];
+
+static rblk_t *rblk_at(uint32_t i)
+{
+    return &rblk[(roldest + i) % rnblk];
+}
+
+static uint32_t ram_first(void)
+{
+    return rused ? rblk_at(0)->first_seq : seq_next;
+}
+
+static void ram_add(const rec_t *r)
+{
+    if (!rnblk) {
+        return;
+    }
+    uint8_t buf[STORE_ENC_MAX];
+    int n = rused ? coder_put(&renc, r, buf) : 0;
+    if (!rused || rblk[rcur].used + n > RBLK) {
+        if (rused == rnblk) {           // full: the oldest block goes
+            roldest = (roldest + 1) % rnblk;
+            rused--;
+            rfull = true;
+        }
+        rcur = rused ? (rcur + 1) % rnblk : roldest;
+        rblk[rcur] = (rblk_t){r->seq, r->up10, 0};
+        rused++;
+        store_coder_reset(&renc, r->seq, r->up10);
+        n = coder_put(&renc, r, buf);
+    }
+    memcpy(rdata + rcur * RBLK + rblk[rcur].used, buf, n);
+    rblk[rcur].used += n;
+    coder_note(&renc, r);
+    rrecs++;
+    rbytes += n;
+}
+
+// Readings with seq > since in order, at most max.
+static int ram_read(uint32_t since, rec_t *out, int max)
+{
+    if (!rused || since + 1 >= seq_next) {
+        return 0;
+    }
+    uint32_t lo = 0, hi = rused;        // the last block that starts at or before since + 1
+    while (lo + 1 < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (rblk_at(mid)->first_seq <= since + 1) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    int n = 0;
+    for (uint32_t i = lo; i < rused && n < max; i++) {
+        const rblk_t *b = rblk_at(i);
+        const uint8_t *p = rdata + ((roldest + i) % rnblk) * RBLK;
+        uint32_t off = 0;
+        store_coder_reset(&rdec, b->first_seq, b->up10_base);
+        while (n < max && coder_get(&rdec, p, &off, b->used, &out[n])) {
+            if (out[n].seq > since) {
+                out[n].boot = g_boot;
+                out[n].model = g_chargers[out[n].src].model;
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+// ------------------------------------------------------------------ flash log
+// Sector (4 KB): header, then records (coded as in store.h). A record is written body first and its tag byte
+// last, so a record cut by a power loss leaves the tag erased (0xFF) and ends the sector. Every boot starts a new
+// sector.
+#define SECTOR 4096
+#define MAGIC 0x314C4242u               // "BBL1"
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t logid;
+    uint32_t sec_no;            // counts up, the oldest sector has the lowest number
+    uint32_t first_seq;
+    uint32_t up10_base;
+    uint16_t boot;
+    uint16_t rsv;
+} sec_hdr_t;
+
+typedef struct {
+    uint32_t sec_no;            // 0 = not part of the log
+    uint32_t first_seq;
+    uint32_t up10_base;
+    uint16_t boot;
+} sec_info_t;
+
+static const esp_partition_t *part;
+static uint32_t nsec;
+static sec_info_t *secs;
+static uint32_t sec_no_last, oldest_pos, used;    // used: sectors of the log, from oldest_pos on
+static bool cur_open;                              // a sector is being written (the newest one)
+static uint32_t cur_pos, wpos;
+static store_coder_t fenc, fdec;
+static uint8_t *sbuf;                               // one sector for reading
+static uint32_t flash_recs, flash_bytes;
+static uint32_t last_written;                      // sequence number of the newest record in flash
 
 static void flash_scan(void)
 {
@@ -253,37 +471,8 @@ static bool flash_new_sector(const rec_t *r)
     cur_pos = pos;
     cur_open = true;
     wpos = sizeof h;
-    prev_seq = r->seq;
-    prev_up10 = r->up10;
-    memset(prev_len, 0, sizeof prev_len);
+    store_coder_reset(&fenc, r->seq, r->up10);
     return true;
-}
-
-static int encode(const rec_t *r, uint8_t *buf)
-{
-    int k = r->src * 8 + r->slot;
-    bool full = prev_len[k] != r->len;
-    int n = 1;
-    n += put_varint(buf + n, r->seq - prev_seq);
-    n += put_varint(buf + n, r->up10 - prev_up10);
-    if (full) {
-        buf[n++] = r->len;
-        memcpy(buf + n, r->raw, r->len);
-        n += r->len;
-    } else {
-        int mbytes = (r->len + 7) / 8;
-        uint8_t *mask = buf + n;
-        memset(mask, 0, mbytes);
-        n += mbytes;
-        for (int i = 0; i < r->len; i++) {
-            if (r->raw[i] != prev_raw[k][i]) {
-                mask[i / 8] |= 1 << (i % 8);
-                buf[n++] = r->raw[i];
-            }
-        }
-    }
-    buf[0] = (full ? 0x40 : 0) | (r->src & 7) << 3 | (r->slot & 7);
-    return n;
 }
 
 static void flash_write(const rec_t *r)
@@ -291,21 +480,21 @@ static void flash_write(const rec_t *r)
     if (!part || !g_cfg.flash_log) {
         return;
     }
-    uint8_t buf[8 + 2 * 5 + REC_RAW_MAX];
+    uint8_t buf[STORE_ENC_MAX];
     int n = 0;
     if (r->seq <= last_written) {
         ESP_LOGW(TAG, "reading %lu out of order, not written", (unsigned long)r->seq);
         return;
     }
-    if (cur_open && secs[cur_pos].boot == r->boot && r->seq > prev_seq && r->up10 >= prev_up10) {
-        n = encode(r, buf);
+    if (cur_open && secs[cur_pos].boot == r->boot && r->seq > fenc.seq && r->up10 >= fenc.up10) {
+        n = coder_put(&fenc, r, buf);
     }
     if (n == 0 || wpos + n > SECTOR) {
         if (!flash_new_sector(r)) {
             cur_open = false;
             return;
         }
-        n = encode(r, buf);
+        n = coder_put(&fenc, r, buf);
     }
     // body first, the tag byte last (see above)
     if (esp_partition_write(part, cur_pos * SECTOR + wpos + 1, buf + 1, n - 1) != ESP_OK ||
@@ -318,11 +507,7 @@ static void flash_write(const rec_t *r)
     last_written = r->seq;
     flash_recs++;
     flash_bytes += n;
-    int k = r->src * 8 + r->slot;
-    prev_seq = r->seq;
-    prev_up10 = r->up10;
-    prev_len[k] = r->len;
-    memcpy(prev_raw[k], r->raw, r->len);
+    coder_note(&fenc, r);
 }
 
 // Decodes sector pos into out (records with since < seq < limit), returns the count; *stop: limit reached.
@@ -332,65 +517,18 @@ static int flash_decode(uint32_t pos, uint32_t since, uint32_t limit, rec_t *out
     if (!si->sec_no || esp_partition_read(part, pos * SECTOR, sbuf, SECTOR) != ESP_OK) {
         return 0;
     }
-    uint8_t plen[MAX_CHARGERS * 8] = {0};
-    static uint8_t praw[MAX_CHARGERS * 8][REC_RAW_MAX];
-    uint32_t off = sizeof(sec_hdr_t), seq = si->first_seq, up = si->up10_base, d;
+    uint32_t off = sizeof(sec_hdr_t);
     int n = 0;
-    while (off < SECTOR && n < max) {
-        uint8_t tag = sbuf[off++];
-        if (tag & 0x80) {
-            break;
-        }
-        int src = (tag >> 3) & 7, slot = tag & 7, k = src * 8 + slot;
-        if (!get_varint(sbuf, &off, SECTOR, &d)) {
-            break;
-        }
-        seq += d;
-        if (!get_varint(sbuf, &off, SECTOR, &d)) {
-            break;
-        }
-        up += d;
-        if (tag & 0x40) {
-            if (off >= SECTOR) {
-                break;
-            }
-            uint8_t len = sbuf[off++];
-            if (len > REC_RAW_MAX || off + len > SECTOR) {
-                break;
-            }
-            memcpy(praw[k], sbuf + off, len);
-            plen[k] = len;
-            off += len;
-        } else {
-            int len = plen[k], mbytes = (len + 7) / 8;
-            if (!len || off + mbytes > SECTOR) {
-                break;
-            }
-            const uint8_t *mask = sbuf + off;
-            off += mbytes;
-            for (int i = 0; i < len; i++) {
-                if (mask[i / 8] & (1 << (i % 8))) {
-                    if (off >= SECTOR) {
-                        return n;
-                    }
-                    praw[k][i] = sbuf[off++];
-                }
-            }
-        }
-        if (seq >= limit) {
+    store_coder_reset(&fdec, si->first_seq, si->up10_base);
+    while (n < max && coder_get(&fdec, sbuf, &off, SECTOR, &out[n])) {
+        if (out[n].seq >= limit) {
             *stop = true;
             break;
         }
-        if (seq > since) {
-            rec_t *r = &out[n++];
-            r->seq = seq;
-            r->up10 = up;
-            r->boot = si->boot;
-            r->src = src;
-            r->slot = slot;
-            r->len = plen[k];
-            r->model = g_chargers[src].model;
-            memcpy(r->raw, praw[k], plen[k]);
+        if (out[n].seq > since) {
+            out[n].boot = si->boot;
+            out[n].model = g_chargers[out[n].src].model;
+            n++;
         }
     }
     return n;
@@ -567,12 +705,16 @@ void store_init(void)
         nvs_close(h);
     }
 
-    ram_cap = RAM_BYTES / sizeof(rec_t);
-    ram = heap_caps_malloc(ram_cap * sizeof(rec_t), MALLOC_CAP_SPIRAM);
-    if (!ram) {
+    rnblk = RAM_BYTES / RBLK;
+    rdata = heap_caps_malloc(rnblk * RBLK, MALLOC_CAP_SPIRAM);
+    if (!rdata) {
         ESP_LOGW(TAG, "no PSRAM, small ring buffer only");
-        ram_cap = RAM_FALLBACK;
-        ram = heap_caps_malloc(ram_cap * sizeof(rec_t), MALLOC_CAP_8BIT);
+        rnblk = RAM_FALLBACK / RBLK;
+        rdata = heap_caps_malloc(rnblk * RBLK, MALLOC_CAP_8BIT);
+    }
+    rblk = heap_caps_calloc(rnblk, sizeof(rblk_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rdata || !rblk) {
+        rnblk = 0;
     }
     thin = heap_caps_calloc(MAX_CHARGERS * 8, sizeof(thin_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!thin) {
@@ -595,7 +737,7 @@ void store_init(void)
     } else {
         ESP_LOGE(TAG, "partition bblog missing");
     }
-    ESP_LOGI(TAG, "ring buffer %lu readings, log id %08lx, next seq %lu", (unsigned long)ram_cap,
+    ESP_LOGI(TAG, "ring buffer %lu KB, log id %08lx, next seq %lu", (unsigned long)(rnblk * RBLK / 1024),
              (unsigned long)logid, (unsigned long)seq_next);
 }
 
@@ -612,11 +754,7 @@ void store_add(uint8_t src, uint8_t model, uint8_t slot, const uint8_t *raw, int
         seq_reserved = seq_next + SEQ_BLOCK;
         nvs_put_u32("seqres", seq_reserved);
     }
-    if (ram_count == ram_cap) {
-        ram_start = (ram_start + 1) % ram_cap;
-        ram_count--;
-    }
-    *ram_at(ram_count++) = r;
+    ram_add(&r);
     if (src < MAX_CHARGERS && slot < 8) {
         live[src][slot] = r;
         live_ok[src][slot] = true;
@@ -678,19 +816,11 @@ void store_note_fetched(uint32_t since)
     xSemaphoreGive(lock);
 }
 
-static uint32_t ram_find(uint32_t since)
+// Readings in RAM after since (RAM has every number from ram_first() on).
+static uint32_t ram_after(uint32_t since)
 {
-    // binary search: first record in RAM with seq > since
-    uint32_t lo = 0, hi = ram_count;
-    while (lo < hi) {
-        uint32_t mid = (lo + hi) / 2;
-        if (ram_at(mid)->seq <= since) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
+    uint32_t from = since + 1 > ram_first() ? since + 1 : ram_first();
+    return rused && from < seq_next ? seq_next - from : 0;
 }
 
 // Position (from the oldest) of the last sector that starts at or before seq.
@@ -706,21 +836,19 @@ static uint32_t sec_index(uint32_t seq)
 bool store_open(uint32_t *count, bool *exact, uint16_t *boot, uint32_t *up10)
 {
     xSemaphoreTake(lock, portMAX_DELAY);
-    uint32_t ram_first = ram_count ? ram_at(0)->seq : seq_next;
-    uint32_t i = ram_find(fetched.seq);
+    uint32_t rfirst = ram_first();
     rec_t r;
     bool ok = false;
-    *count = ram_count - i;
+    *count = ram_after(fetched.seq);
     *exact = true;
-    if (fetched.seq + 1 < ram_first && flash_read(fetched.seq, ram_first, &r, 1) == 1) {
+    if (fetched.seq + 1 < rfirst && flash_read(fetched.seq, rfirst, &r, 1) == 1) {
         ok = true;
         // flash part: the sectors from the one with that reading to the one where RAM begins (later flash
         // records are in RAM as well)
         double per_sector = flash_recs > 20 ? SECTOR * (double)flash_recs / flash_bytes : SECTOR / 10.0;
-        *count += (uint32_t)((sec_index(ram_first - 1) - sec_index(r.seq) + 0.5) * per_sector);
+        *count += (uint32_t)((sec_index(rfirst - 1) - sec_index(r.seq) + 0.5) * per_sector);
         *exact = false;
-    } else if (i < ram_count) {
-        r = *ram_at(i);
+    } else if (ram_read(fetched.seq, &r, 1) == 1) {
         ok = true;
     }
     if (ok) {
@@ -734,10 +862,10 @@ bool store_open(uint32_t *count, bool *exact, uint16_t *boot, uint32_t *up10)
 int store_read(uint32_t since, int max, rec_t *out, bool *more)
 {
     xSemaphoreTake(lock, portMAX_DELAY);
-    uint32_t ram_first = ram_count ? ram_at(0)->seq : seq_next;
+    uint32_t rfirst = ram_first();
     int n = 0;
-    if (since + 1 < ram_first) {
-        n = flash_read(since, ram_first, out, max);
+    if (since + 1 < rfirst) {
+        n = flash_read(since, rfirst, out, max);
         if (n) {
             since = out[n - 1].seq;
         }
@@ -746,15 +874,12 @@ int store_read(uint32_t since, int max, rec_t *out, bool *more)
             xSemaphoreGive(lock);
             return n;
         }
-        if (since + 1 < ram_first) {
-            since = ram_first - 1;      // the rest of the gap is lost (not in flash)
+        if (since + 1 < rfirst) {
+            since = rfirst - 1;      // the rest of the gap is lost (not in flash)
         }
     }
-    uint32_t lo = ram_find(since);
-    while (lo < ram_count && n < max) {
-        out[n++] = *ram_at(lo++);
-    }
-    *more = lo < ram_count;
+    n += ram_read(since, out + n, max - n);
+    *more = ram_after(n ? out[n - 1].seq : since) > 0;
     xSemaphoreGive(lock);
     return n;
 }
@@ -779,11 +904,15 @@ void store_stats(store_stats_t *s)
     xSemaphoreTake(lock, portMAX_DELAY);
     s->logid = logid;
     s->seq_next = seq_next;
-    s->ram_cap = ram_cap;
-    s->ram_count = ram_count;
-    if (ram_count) {
-        s->ram_first_seq = ram_at(0)->seq;
-        s->ram_first_up10 = ram_at(0)->up10;
+    s->ram_count = ram_after(0);
+    s->ram_bytes = rused ? (rused - 1) * RBLK + rblk[rcur].used : 0;
+    s->ram_bytes_cap = rnblk * RBLK;
+    s->ram_full = rfull;
+    // full: what it holds; else estimated from the bytes per reading so far (at first ~10)
+    s->ram_cap = rfull ? s->ram_count : (uint32_t)((double)s->ram_bytes_cap * (rrecs > 100 ? (double)rrecs / rbytes : 0.1));
+    if (rused) {
+        s->ram_first_seq = rblk_at(0)->first_seq;
+        s->ram_first_up10 = rblk_at(0)->up10_base;
     }
     s->flash_ok = part != NULL;
     s->flash_sectors = nsec;
@@ -805,6 +934,15 @@ void store_stats(store_stats_t *s)
     s->flash_bytes = flash_bytes;
     s->clock_set = clock_ok;
     s->fetched_seq = fetched.seq;
+    s->ram_open = ram_after(fetched.seq);
+    if (used && fetched.seq < secs[oldest_pos].first_seq) {
+        s->flash_open = used;                       // nothing in flash fetched yet
+    } else if (used) {
+        s->flash_open = used - 1 - sec_index(fetched.seq);    // the sectors after the one with that reading
+        if (!s->flash_open && fetched.seq + 1 < seq_next && s->ram_open) {
+            s->flash_open = 1;                      // the newest sector has unfetched readings as well
+        }
+    }
     s->fetch_secs = fetched_now ? (int32_t)((store_uptime10() - fetched_up10) / 10) : -1;
     s->fetch_t = fetched.t;
     xSemaphoreGive(lock);
@@ -820,7 +958,8 @@ esp_err_t store_clear(void)
     }
     used = 0;
     cur_open = false;
-    ram_start = ram_count = 0;
+    rused = rrecs = rbytes = 0;
+    rfull = false;
     outn = 0;
     memset(thin, 0, MAX_CHARGERS * 8 * sizeof(thin_t));
     flash_recs = flash_bytes = 0;

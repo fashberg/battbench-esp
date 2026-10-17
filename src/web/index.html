@@ -41,7 +41,8 @@ button.d{border-color:var(--err);color:var(--err)}
 table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
 th{color:var(--mut);font-weight:500}
 tr.pick{cursor:pointer}tr.pick:hover{background:var(--bg)}
-.bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin:4px 0 2px}.bar i{display:block;height:100%;background:var(--acc)}
+.bar{display:flex;height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin:4px 0 2px}.bar i{display:block;height:100%;background:var(--ok)}.bar i.new{background:var(--acc)}
+.key i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 4px 0 8px;vertical-align:-1px;background:var(--ok)}.key i.new{background:var(--acc)}.key i.free{background:var(--line)}
 .mut{color:var(--mut)}.msg{margin-top:10px;min-height:1.4em}
 .hidden{display:none}
 </style>
@@ -158,7 +159,7 @@ const DE={"Status":"Status","Wi-Fi":"WLAN","Bluetooth":"Bluetooth","Storage":"Sp
 "Clear the whole log (RAM and flash)?":"Das ganze Log (RAM und Flash) löschen?","Log cleared.":"Log gelöscht.","Uploading …":"Lade hoch …",
 "ago":"her","days":"Tage","hours":"Std.","Log id":"Log-ID","Next number":"Nächste Nummer","Select":"Übernehmen","off (charger only in RAM)":"aus (nur RAM)",
 "Range":"Reichweite","never":"noch nie","(before restart)":"(vor Neustart)","before the restart":"vor dem Neustart","nothing, all fetched":"nichts, alles abgerufen",
-"readings":"Messwerte","only 1 per minute":"nur 1 pro Minute","only 1 every":"nur 1 alle","before":"vor","oldest":"ältester","Fetched":"Abgerufen","Not fetched":"Offen",
+"readings":"Messwerte","only 1 per minute":"nur 1 pro Minute","only 1 every":"nur 1 alle","before":"vor","oldest":"ältester","Fetched":"Abgerufen","fetched":"abgerufen","new":"neu","free":"frei","Not fetched":"Offen",
 "Flash every":"Flash alle","per slot":"pro Schacht","every reading":"jeder Messwert",
 "Every reading (each slot every poll interval). Lost on a power loss.":"Jeder Messwert (jeder Schacht in jedem Abfrage-Intervall). Geht bei Stromausfall verloren.",
 "Oldest reading in RAM":"Ältester Messwert im RAM","Thinned readings, written right away, kept over a power loss":"Ausgedünnte Messwerte, sofort geschrieben, bleiben bei Stromausfall erhalten",
@@ -190,7 +191,6 @@ document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{tab=b.dataset.
 
 function storeRows(s,st){
   const bpr=s.flash_recs?s.flash_bytes/s.flash_recs:0;
-  const usedPct=s.flash_sectors?100*s.flash_used/s.flash_sectors:0;
   const mb=x=>(x*4096/1048576).toFixed(1);
   let range='–';
   if(s.flash_first_t&&st.now&&s.flash_timed>2){const span=st.now-s.flash_first_t;range='≈ '+(span*s.flash_sectors/s.flash_timed/86400).toFixed(1)+' '+t('days')}
@@ -210,11 +210,15 @@ function storeRows(s,st){
       +(s.open_exact||!s.thin_secs?'':` (${s.ram_count&&s.ram_first_t?t('before')+' '+hm(s.ram_first_t)+' ':''}${per})`)
       +(s.open_first_t?` · ${t('oldest')} ${ts(s.open_first_t)}`:'')+(age>=60?` (${ago(dur(age))})`:'');
   }
-  return [['RAM',`${num(s.ram_count)} / ${num(s.ram_cap)} ${t('readings')}<div class="bar"><i style="width:${100*s.ram_count/s.ram_cap}%"></i></div>`,
+  // green: fetched by BattBench, blue: not yet, grey: free
+  const bar=(done,fresh,cap)=>cap?`<div class="bar"><i style="width:${100*done/cap}%"></i><i class="new" style="width:${100*fresh/cap}%"></i></div>`:'';
+  const ramOpen=Math.min(s.ram_open||0,s.ram_count),flOpen=Math.min(s.flash_open||0,s.flash_used);
+  return [['RAM',`${num(s.ram_count)} / ${num(s.ram_cap)} ${t('readings')}${bar(s.ram_count-ramOpen,ramOpen,s.ram_cap)}`,
      'Every reading (each slot every poll interval). Lost on a power loss.'],
    ['RAM since',ts(s.ram_first_t),'Oldest reading in RAM'],
-   ['Flash',s.flash_log?`${mb(s.flash_used)} / ${mb(s.flash_sectors)} MB<div class="bar"><i style="width:${usedPct}%"></i></div>`:t('off (charger only in RAM)'),
+   ['Flash',s.flash_log?`${mb(s.flash_used)} / ${mb(s.flash_sectors)} MB${bar(s.flash_used-flOpen,flOpen,s.flash_sectors)}`:t('off (charger only in RAM)'),
      'Thinned readings, written right away, kept over a power loss'],
+   ['',`<span class="key mut"><i></i>${t('fetched')}<i class="new"></i>${t('new')}<i class="free"></i>${t('free')}</span>`],
    ['Flash since',ts(s.flash_first_t),'Oldest reading in flash with a known time'],
    ['Fetched',fetched,'Last time BattBench fetched readings. Fetching deletes nothing.'],
    ['Not fetched',open,'Readings BattBench does not have yet'],

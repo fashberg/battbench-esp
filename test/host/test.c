@@ -149,8 +149,9 @@ int main(int argc, char **argv)
     printf("input %d readings over %.2f days\n", n, (t - t0) / 86400);
     printf("flash: %u records, %u bytes, %.2f bytes/record, %u of %u sectors, bad writes %ld\n", s.flash_recs,
            s.flash_bytes, (double)s.flash_bytes / s.flash_recs, s.flash_used, s.flash_sectors, bad_writes);
-    printf("RAM: %u of %u, first seq %u; flash first seq %u\n", s.ram_count, s.ram_cap, s.ram_first_seq,
-           s.flash_first_seq);
+    printf("RAM: %u of %u, %.2f bytes/reading (%u of %u bytes, full %d), first seq %u; flash first seq %u\n",
+           s.ram_count, s.ram_cap, (double)s.ram_bytes / s.ram_count, s.ram_bytes, s.ram_bytes_cap, s.ram_full,
+           s.ram_first_seq, s.flash_first_seq);
 
     // not fetched yet: count (estimated in flash) against the real number
     uint32_t fetch_at[] = {0, s.flash_first_seq + 5000, s.ram_first_seq + 100, s.seq_next - 1};
@@ -197,5 +198,36 @@ int main(int argc, char **argv)
     }
     printf("read back %ld (from flash %ld, boot 1: %ld), wrong %ld, out of order %ld, reaches back %.2f days\n",
            got, from_flash, boot1, mism, order, (t - first_t) / 86400);
+
+    // the same as /api/records?fmt=bin (one answer) and as text; test_bin.py decodes it with BattBench's decoder
+    store_clock_set();                  // boot 2 gets a clock, boot 1 stays without
+    FILE *fb = fopen("records.bin", "wb"), *ft = fopen("records.txt", "w");
+    static uint8_t sb[STORE_STREAM_MAX];
+    static store_stream_t strm;
+    store_stats(&s);
+    fwrite(sb, 1, store_bin_header(sb, s.logid, s.seq_next, false, got), fb);
+    since = 0;
+    more = true;
+    long bin_bytes = STORE_BIN_HDR + 1;
+    while (more) {
+        int k = store_read(since, 1000, out, &more);
+        for (int i = 0; i < k; i++) {
+            rec_t *r = &out[i];
+            int len = store_stream_put(&strm, r, sb);
+            fwrite(sb, 1, len, fb);
+            bin_bytes += len;
+            double ut;
+            if (store_unix(r->boot, r->up10, &ut)) fprintf(ft, "%u %.1f %u %u ", r->seq, ut, r->src, r->slot);
+            else fprintf(ft, "%u None %u %u ", r->seq, r->src, r->slot);
+            for (int j = 0; j < r->len; j++) fprintf(ft, "%02x", r->raw[j]);
+            fprintf(ft, "\n");
+        }
+        if (!k) break;
+        since = out[k - 1].seq;
+    }
+    fputc(0xFF, fb);
+    fclose(fb);
+    fclose(ft);
+    printf("binary: %ld bytes, %.2f bytes/reading\n", bin_bytes, (double)bin_bytes / got);
     return mism || order || bad_writes ? 1 : 0;
 }

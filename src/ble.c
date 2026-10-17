@@ -114,6 +114,33 @@ static void note_adv(const struct ble_gap_disc_desc *d)
     taskEXIT_CRITICAL(&mux);
 }
 
+// Connection interval while polling (units of 1.25 ms): 100-150 ms. Wi-Fi shares the radio with Bluetooth; with the
+// short interval chargers ask for, Bluetooth takes most of the air time and HTTP ran at 15-100 KB/s (~290 KB/s
+// without Bluetooth). A status query every half second needs no short interval.
+#define ITVL_MIN 80
+#define ITVL_MAX 120
+static volatile bool slow_itvl;         // set after the discovery, which is faster with the charger's interval
+
+static void note_interval(void)
+{
+    struct ble_gap_conn_desc d;
+    if (conn != BLE_HS_CONN_HANDLE_NONE && ble_gap_conn_find(conn, &d) == 0) {
+        st.itvl_ms = d.conn_itvl * 5 / 4;
+    }
+}
+
+static void slow_interval(void)
+{
+    slow_itvl = true;
+    note_interval();
+    struct ble_gap_upd_params p = {.itvl_min = ITVL_MIN, .itvl_max = ITVL_MAX, .latency = 0,
+                                   .supervision_timeout = 600};   // 6 s
+    int rc = ble_gap_update_params(conn, &p);
+    if (rc) {
+        ESP_LOGW(TAG, "connection interval: error %d", rc);
+    }
+}
+
 static int gap_event(struct ble_gap_event *e, void *arg)
 {
     switch (e->type) {
@@ -127,6 +154,8 @@ static int gap_event(struct ble_gap_event *e, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (e->connect.status == 0) {
             conn = e->connect.conn_handle;
+            slow_itvl = false;
+            note_interval();
             xEventGroupSetBits(ev, BIT_CONNECTED);
         } else {
             set_error("connect failed (%d)", e->connect.status);
@@ -152,6 +181,17 @@ static int gap_event(struct ble_gap_event *e, void *arg)
     }
     case BLE_GAP_EVENT_MTU:
         st.mtu = e->mtu.value;
+        break;
+    case BLE_GAP_EVENT_CONN_UPDATE_REQ:
+    case BLE_GAP_EVENT_L2CAP_UPDATE_REQ:
+        // the charger asks for a short interval: keep a long one once polling runs (see slow_interval)
+        if (slow_itvl && e->conn_update_req.self_params->itvl_max < ITVL_MIN) {
+            e->conn_update_req.self_params->itvl_min = ITVL_MIN;
+            e->conn_update_req.self_params->itvl_max = ITVL_MAX;
+        }
+        break;
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        note_interval();
         break;
     default:
         break;
@@ -376,6 +416,7 @@ static bool connect_charger(void)
     }
     vTaskDelay(pdMS_TO_TICKS(1000));
     drain();
+    slow_interval();
     if (info.model != CH_MC3000) {
         // MC5000: answers the status query only after the app's handshake 0x57 (device info); skyrc-mc-rs sends
         // just this in its read-only mode. Never the init sequence 74 / 65 / FE (resets running tasks).

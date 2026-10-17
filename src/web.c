@@ -3,7 +3,8 @@
 //   GET  /api/info              firmware, log id, chargers (index -> model, address), next sequence number
 //   GET  /api/status            Wi-Fi, Bluetooth, storage, clock, live values of the connected charger
 //   GET  /api/records?since=N&max=M   readings with sequence number > N: [seq, unix time or null, charger
-//                               index, slot, packet hex]; "more": true if there are further ones
+//                               index, slot, packet hex]; "more": true if there are further ones; &fmt=bin: binary
+//                               (format in store.h)
 //   GET  /api/config            settings (passwords left out)      POST /api/config  JSON with changed fields
 //   GET  /api/wifiscan          networks in reach                  GET  /api/blescan  SkyRC chargers seen
 //   POST /api/blescan           new Bluetooth scan                 POST /api/time    {"t": unix} (if no SNTP)
@@ -30,6 +31,8 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
+#include "miniz.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "led.h"
@@ -42,7 +45,7 @@ static const char *TAG = "web";
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[] asm("_binary_index_html_end");
 
-#define MAX_RECORDS 1000
+#define MAX_RECORDS 5000
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *j)
 {
@@ -159,6 +162,9 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(w, "ip", n.ip);
     cJSON_AddNumberToObject(w, "rssi", n.rssi);
     cJSON_AddBoolToObject(w, "ap", n.ap_on);
+    wifi_ps_type_t ps = WIFI_PS_NONE;
+    esp_wifi_get_ps(&ps);
+    cJSON_AddStringToObject(w, "ps", ps == WIFI_PS_NONE ? "none" : "modem sleep");
     cJSON_AddStringToObject(w, "ap_ssid", n.ap_ssid);
     cJSON_AddStringToObject(w, "hostname", g_cfg.hostname);
 
@@ -170,6 +176,7 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(bj, "name", b.name);
     cJSON_AddStringToObject(bj, "model", ch_model_name(b.model));
     cJSON_AddNumberToObject(bj, "mtu", b.mtu);
+    cJSON_AddNumberToObject(bj, "itvl_ms", b.itvl_ms);
     cJSON_AddNumberToObject(bj, "connected_secs", b.connected_up10 ? (now10 - b.connected_up10) / 10 : 0);
     cJSON_AddNumberToObject(bj, "answers", b.answers);
     cJSON_AddNumberToObject(bj, "misses", b.misses);
@@ -203,6 +210,8 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(sj, "thin_secs", g_cfg.thin_secs);
     // fetching by BattBench: last time, and the readings it does not have yet
     cJSON_AddNumberToObject(sj, "fetched_seq", s.fetched_seq);
+    cJSON_AddNumberToObject(sj, "ram_open", s.ram_open);
+    cJSON_AddNumberToObject(sj, "flash_open", s.flash_open);
     cJSON_AddNumberToObject(sj, "fetch_secs", s.fetch_secs);
     if (s.fetch_t) {
         cJSON_AddNumberToObject(sj, "fetch_t", (double)(int64_t)s.fetch_t);
@@ -260,6 +269,13 @@ static uint32_t query_u32(httpd_req_t *req, const char *key, uint32_t def)
     return def;
 }
 
+static bool query_is(httpd_req_t *req, const char *key, const char *val)
+{
+    char q[128], v[16];
+    return httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK &&
+           httpd_query_key_value(q, key, v, sizeof v) == ESP_OK && strcmp(v, val) == 0;
+}
+
 static void peer_ip(httpd_req_t *req, char *out, size_t len)
 {
     struct sockaddr_storage a;
@@ -282,6 +298,54 @@ static void peer_ip(httpd_req_t *req, char *out, size_t len)
     }
 }
 
+// Output of /api/records: plain, or deflated (zlib format, "Content-Encoding: deflate") when the client accepts it.
+// The hex JSON shrinks ~5 times, and Wi-Fi next to Bluetooth is the bottleneck when BattBench catches up.
+// fmt=bin: the readings coded as in the flash log (format in store.h), much smaller still.
+typedef struct {
+    httpd_req_t *req;
+    tdefl_compressor *z;        // NULL: plain
+    char *out;                  // deflated bytes waiting to be sent
+    int out_len;
+} rec_out_t;
+
+enum { REC_BUF = 16384, OUT_CHUNK = 4096 };    // deflated output goes out in small parts: sent while the rest is compressed
+
+static mz_bool rec_put(const void *data, int len, void *user)
+{
+    rec_out_t *o = user;
+    while (len > 0) {
+        int k = len < OUT_CHUNK - o->out_len ? len : OUT_CHUNK - o->out_len;
+        memcpy(o->out + o->out_len, data, k);
+        o->out_len += k;
+        data = (const char *)data + k;
+        len -= k;
+        if (o->out_len == OUT_CHUNK) {
+            httpd_resp_send_chunk(o->req, o->out, o->out_len);
+            o->out_len = 0;
+        }
+    }
+    return MZ_TRUE;
+}
+
+static void rec_emit(rec_out_t *o, const char *buf, int len, bool last)
+{
+    if (!o->z) {
+        httpd_resp_send_chunk(o->req, buf, len);
+        return;
+    }
+    tdefl_compress_buffer(o->z, buf, len, last ? TDEFL_FINISH : TDEFL_NO_FLUSH);
+    if (last && o->out_len) {
+        httpd_resp_send_chunk(o->req, o->out, o->out_len);
+        o->out_len = 0;
+    }
+}
+
+static bool accepts_deflate(httpd_req_t *req)
+{
+    char v[64];
+    return httpd_req_get_hdr_value_str(req, "Accept-Encoding", v, sizeof v) == ESP_OK && strstr(v, "deflate");
+}
+
 static esp_err_t h_records(httpd_req_t *req)
 {
     uint32_t since = query_u32(req, "since", 0);
@@ -292,17 +356,51 @@ static esp_err_t h_records(httpd_req_t *req)
         max = MAX_RECORDS;
     }
     rec_t *recs = heap_caps_malloc(max * sizeof(rec_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!recs) {
+    char *buf = heap_caps_malloc(2 * REC_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    rec_out_t o = {.req = req, .out = buf + REC_BUF};
+    if (recs && buf && accepts_deflate(req)) {
+        o.z = heap_caps_malloc(sizeof(tdefl_compressor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!recs || !buf) {
+        free(recs);
+        free(buf);
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    }
+    if (o.z) {
+        tdefl_init(o.z, rec_put, &o, 4 | TDEFL_GREEDY_PARSING_FLAG | TDEFL_WRITE_ZLIB_HEADER);   // fast, ~4 times smaller
     }
     bool more = false;
     int n = store_read(since, max, recs, &more);
     store_stats_t s;
     store_stats(&s);
-    httpd_resp_set_type(req, "application/json");
+    store_stream_t *st = query_is(req, "fmt", "bin") ?
+        heap_caps_malloc(sizeof(store_stream_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : NULL;
+    httpd_resp_set_type(req, st ? "application/octet-stream" : "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    char buf[1536];
-    int len = snprintf(buf, sizeof buf, "{\"logid\":\"%08lx\",\"seq_next\":%lu,\"more\":%s,\"records\":[",
+    if (o.z) {
+        httpd_resp_set_hdr(req, "Content-Encoding", "deflate");
+    }
+    if (st) {
+        uint8_t *b = (uint8_t *)buf;
+        int len = store_bin_header(b, s.logid, s.seq_next, more, n);
+        st->open = false;
+        for (int i = 0; i < n; i++) {
+            len += store_stream_put(st, &recs[i], b + len);
+            if (len > REC_BUF - STORE_STREAM_MAX) {
+                rec_emit(&o, buf, len, false);
+                len = 0;
+            }
+        }
+        b[len++] = 0xFF;
+        rec_emit(&o, buf, len, true);
+        free(st);
+        free(o.z);
+        free(buf);
+        free(recs);
+        return httpd_resp_send_chunk(req, NULL, 0);
+    }
+    // large chunks: every send waits for the radio, which Wi-Fi shares with Bluetooth
+    int len = snprintf(buf, REC_BUF, "{\"logid\":\"%08lx\",\"seq_next\":%lu,\"more\":%s,\"records\":[",
                        (unsigned long)s.logid, (unsigned long)s.seq_next, more ? "true" : "false");
     for (int i = 0; i < n; i++) {
         const rec_t *r = &recs[i];
@@ -315,15 +413,17 @@ static esp_err_t h_records(httpd_req_t *req)
             sprintf(hex + 2 * k, "%02x", r->raw[k]);
         }
         hex[2 * r->len] = 0;
-        len += snprintf(buf + len, sizeof buf - len, "%s[%lu,%s,%u,%u,\"%s\"]", i ? "," : "", (unsigned long)r->seq, t,
+        len += snprintf(buf + len, REC_BUF - len, "%s[%lu,%s,%u,%u,\"%s\"]", i ? "," : "", (unsigned long)r->seq, t,
                         r->src, r->slot, hex);
-        if (len > (int)sizeof buf - 160) {
-            httpd_resp_send_chunk(req, buf, len);
+        if (len > REC_BUF - 160) {
+            rec_emit(&o, buf, len, false);
             len = 0;
         }
     }
-    len += snprintf(buf + len, sizeof buf - len, "]}");
-    httpd_resp_send_chunk(req, buf, len);
+    len += snprintf(buf + len, REC_BUF - len, "]}");
+    rec_emit(&o, buf, len, true);
+    free(o.z);
+    free(buf);
     free(recs);
     return httpd_resp_send_chunk(req, NULL, 0);
 }
